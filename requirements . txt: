@@ -1,0 +1,16 @@
+yfinance
+alpha-vantage
+fredapi
+newsapi-python
+vaderSentiment
+pandas
+numpy
+streamlit
+requests
+beautifulsoup4
+python-decouple
+sec-api
+pycoingecko
+scikit-learn
+transformers
+torch
