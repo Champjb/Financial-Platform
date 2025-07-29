@@ -1,0 +1,357 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import streamlit as st
+from alpha_vantage.timeseries import TimeSeries
+from fredapi import Fred
+from newsapi import NewsApiClient
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from sec_api import QueryApi
+from pycoingecko import CoinGeckoAPI
+from sklearn.linear_model import LinearRegression
+from transformers import pipeline
+import requests
+from bs4 import BeautifulSoup
+from decouple import config
+import json
+from datetime import datetime, timedelta
+
+# Load API keys from Streamlit secrets (set in dashboard)
+try:
+    ALPHA_VANTAGE_KEY = st.secrets["ALPHA_VANTAGE_KEY"]
+    FRED_API_KEY = st.secrets["FRED_API_KEY"]
+    NEWSAPI_KEY = st.secrets["NEWSAPI_KEY"]
+    SEC_API_KEY = st.secrets["SEC_API_KEY"]
+except KeyError as e:
+    st.error(f"Missing API key: {e}. Set secrets in Streamlit Cloud dashboard.")
+    st.stop()
+
+# Initialize clients
+ts = TimeSeries(key=ALPHA_VANTAGE_KEY, output_format='pandas')
+fred = Fred(api_key=FRED_API_KEY)
+newsapi = NewsApiClient(api_key=NEWSAPI_KEY)
+sec_api = QueryApi(api_key=SEC_API_KEY)
+coingecko = CoinGeckoAPI()
+analyzer = SentimentIntensityAnalyzer()
+nlp = pipeline("question-answering", model="distilbert-base-cased-distilled-squad")
+
+# Function to fetch stock fundamentals (Yahoo Finance)
+@st.cache_data
+def get_stock_fundamentals(ticker):
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        return {
+            "name": info.get("longName", "N/A"),
+            "pe_ratio": info.get("trailingPE", "N/A"),
+            "market_cap": info.get("marketCap", "N/A"),
+            "revenue": info.get("totalRevenue", "N/A"),
+            "ebitda": info.get("ebitda", "N/A")
+        }
+    except Exception as e:
+        return {"error": f"Failed to fetch fundamentals: {e}"}
+
+# Function to fetch real-time stock data (Yahoo Finance fallback)
+@st.cache_data(ttl=60)
+def get_real_time_stock(ticker):
+    try:
+        stock = yf.Ticker(ticker)
+        data = stock.history(period="1d")
+        return {"price": data["Close"].iloc[-1]}
+    except Exception as e:
+        return {"error": f"Failed to fetch real-time data: {e}"}
+
+# Function to fetch forex data (Alpha Vantage)
+@st.cache_data
+def get_forex_data(from_currency, to_currency):
+    try:
+        data, _ = ts.get_quote_endpoint(symbol=f"{from_currency}{to_currency}")
+        return {
+            "price": data["05. price"].iloc[0],
+            "change": data["09. change"].iloc[0]
+        }
+    except Exception as e:
+        return {"error": f"Failed to fetch forex data: {e}"}
+
+# Function to fetch economic data (FRED)
+@st.cache_data
+def get_economic_data(series_id="GDP"):
+    try:
+        data = fred.get_series(series_id)
+        latest = data.tail(1)
+        return {
+            "series": series_id,
+            "value": latest.iloc[0],
+            "date": latest.index[0].strftime("%Y-%m-%d")
+        }
+    except Exception as e:
+        return {"error": f"Failed to fetch economic data: {e}"}
+
+# Function to fetch World Bank data
+@st.cache_data
+def get_world_bank_data(indicator="NY.GDP.MKTP.CD"):
+    try:
+        url = f"https://api.worldbank.org/v2/country/all/indicator/{indicator}?format=json&per_page=1"
+        response = requests.get(url)
+        data = response.json()[1][0]
+        return {
+            "indicator": indicator,
+            "value": data["value"],
+            "date": data["date"]
+        }
+    except Exception as e:
+        return {"error": f"Failed to fetch World Bank data: {e}"}
+
+# Function to fetch SEC filings
+@st.cache_data
+def get_sec_filings(ticker):
+    try:
+        query = {"query": f"ticker:{ticker} formType:\"10-K\"", "size": 1}
+        filings = sec_api.query(query)
+        return filings["filings"][0] if filings["filings"] else {}
+    except Exception as e:
+        return {"error": f"Failed to fetch SEC filings: {e}"}
+
+# Function to fetch crypto data (CoinGecko)
+@st.cache_data
+def get_crypto_data(coin_id="bitcoin"):
+    try:
+        data = coingecko.get_price(ids=coin_id, vs_currencies="usd")
+        return {"price": data[coin_id]["usd"]}
+    except Exception as e:
+        return {"error": f"Failed to fetch crypto data: {e}"}
+
+# Function to fetch news (NewsAPI)
+@st.cache_data
+def get_financial_news(query="finance"):
+    try:
+        response = newsapi.get_everything(q=query, language="en", sort_by="publishedAt")
+        articles = response.get("articles", [])[:5]
+        return [{"title": a["title"], "source": a["source"]["name"], "url": a["url"]} for a in articles]
+    except Exception as e:
+        return {"error": f"Failed to fetch news: {e}"}
+
+# Function to fetch and analyze X sentiment
+@st.cache_data
+def get_x_sentiment(ticker):
+    try:
+        url = f"https://x.com/search?q={ticker}&src=typed_query"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        response = requests.get(url, headers=headers)
+        soup = BeautifulSoup(response.text, "html.parser")
+        posts = soup.find_all("article")[:5]
+        sentiments = [analyzer.polarity_scores(post.get_text())["compound"] for post in posts]
+        avg_sentiment = np.mean(sentiments) if sentiments else 0
+        return {"sentiment": "Positive" if avg_sentiment > 0 else "Negative", "score": avg_sentiment}
+    except Exception as e:
+        return {"error": f"Failed to fetch X sentiment: {e}"}
+
+# Function for predictive modeling
+@st.cache_data
+def predict_price(ticker):
+    try:
+        data = yf.Ticker(ticker).history(period="1y")["Close"]
+        X = np.arange(len(data)).reshape(-1, 1)
+        y = data.values
+        model = LinearRegression().fit(X, y)
+        next_day = np.array([[len(data)]])
+        pred = model.predict(next_day)[0]
+        return {"predicted_price": pred}
+    except Exception as e:
+        return {"error": f"Failed to predict price: {e}"}
+
+# Function to fetch historical data for chart
+@st.cache_data
+def get_historical_data(ticker, period="1y"):
+    try:
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period=period)
+        return hist[["Open", "High", "Low", "Close"]].reset_index()
+    except Exception as e:
+        return pd.DataFrame()
+
+# Streamlit Dashboard
+def main():
+    st.set_page_config(page_title="Financial Platform", layout="wide")
+    st.title("AI-Powered Financial Research Platform")
+
+    # Sidebar for user input
+    with st.sidebar:
+        st.header("Settings")
+        ticker = st.text_input("Stock Ticker (e.g., AAPL):", "AAPL").upper()
+        coin_id = st.selectbox("Cryptocurrency:", ["bitcoin", "ethereum"])
+        period = st.selectbox("Chart Period:", ["1mo", "3mo", "6mo", "1y"])
+        price_alert = st.number_input("Price Alert Threshold (USD):", min_value=0.0, value=0.0)
+
+    # Tabs for different sections
+    tab1, tab2, tab3, tab4 = st.tabs(["Overview", "Analytics", "News & Sentiment", "Portfolio"])
+
+    # Tab 1: Overview
+    with tab1:
+        st.subheader(f"{ticker} Overview")
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.write("**Fundamentals**")
+            fundamentals = get_stock_fundamentals(ticker)
+            st.write(f"Company: {fundamentals.get('name', 'N/A')}")
+            st.write(f"P/E Ratio: {fundamentals.get('pe_ratio', 'N/A')}")
+            st.write(f"Market Cap: {fundamentals.get('market_cap', 'N/A')}")
+            st.write(f"Revenue: {fundamentals.get('revenue', 'N/A')}")
+            st.write(f"EBITDA: {fundamentals.get('ebitda', 'N/A')}")
+
+            st.write("**Latest SEC Filing (10-K)**")
+            filing = get_sec_filings(ticker)
+            if "error" not in filing:
+                st.write(f"Filed: {filing.get('filedAt', 'N/A')} ([Link]({filing.get('link', '#')}))")
+            else:
+                st.write(filing["error"])
+
+        with col2:
+            st.write("**Real-Time Stock Data**")
+            real_time = get_real_time_stock(ticker)
+            price = real_time.get("price", "N/A")
+            st.write(f"Latest Price: ${price}")
+            if price_alert > 0 and isinstance(price, float) and price >= price_alert:
+                st.warning(f"Alert: {ticker} price (${price}) exceeds threshold (${price_alert})!")
+
+            st.write("**Cryptocurrency**")
+            crypto = get_crypto_data(coin_id)
+            st.write(f"{coin_id.capitalize()} Price: ${crypto.get('price', 'N/A')}")
+
+            st.write("**Economic Data**")
+            gdp = get_economic_data("GDP")
+            st.write(f"Latest GDP: {gdp.get('value', 'N/A')} ({gdp.get('date', 'N/A')})")
+            wb_gdp = get_world_bank_data()
+            st.write(f"World Bank GDP: {wb_gdp.get('value', 'N/A')} ({wb_gdp.get('date', 'N/A')})")
+
+    # Tab 2: Analytics
+    with tab2:
+        st.subheader("Analytics")
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.write("**Price Prediction (Next Day)**")
+            pred = predict_price(ticker)
+            st.write(f"Predicted Price: ${pred.get('predicted_price', 'N/A'):.2f}")
+
+        with col2:
+            st.write("**Stock Price Trend**")
+            hist_data = get_historical_data(ticker, period)
+            if not hist_data.empty:
+                labels = hist_data["Date"].dt.strftime("%Y-%m-%d").tolist()
+                chart_config = {
+                    "type": "line",
+                    "data": {
+                        "labels": labels,
+                        "datasets": [{
+                            "label": f"{ticker} Price",
+                            "data": hist_data["Close"].tolist(),
+                            "borderColor": "#36A2EB",
+                            "backgroundColor": "rgba(54, 162, 235, 0.2)",
+                            "fill": True
+                        }]
+                    },
+                    "options": {
+                        "responsive": True,
+                        "plugins": {"title": {"display": True, "text": f"{ticker} Price Chart"}},
+                        "scales": {
+                            "y": {"beginAtZero": False, "title": {"display": True, "text": "Price (USD)"}},
+                            "x": {"title": {"display": True, "text": "Date"}}
+                        }
+                    }
+                }
+                st.markdown(
+                    f"""
+                    <div style='width:100%; height:400px;'>
+                        <canvas id='chart'></canvas>
+                    </div>
+                    <script src='https://cdn.jsdelivr.net/npm/chart.js'></script>
+                    <script>
+                        var ctx = document.getElementById('chart').getContext('2d');
+                        new Chart(ctx, {json.dumps(chart_config)});
+                    </script>
+                    """,
+                    unsafe_allow_html=True
+                )
+            else:
+                st.write("Failed to fetch historical data.")
+
+    # Tab 3: News & Sentiment
+    with tab3:
+        st.subheader("News & Sentiment")
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.write("**Financial News**")
+            news = get_financial_news(ticker)
+            for article in news:
+                if "error" not in article:
+                    st.write(f"{article['title']} - {article['source']} ([Link]({article['url']}))")
+                else:
+                    st.write(article["error"])
+
+        with col2:
+            st.write("**X Sentiment**")
+            sentiment = get_x_sentiment(ticker)
+            if "error" not in sentiment:
+                st.write(f"Sentiment: {sentiment['sentiment']} (Score: {sentiment['score']:.2f})")
+                st.progress(max(0, min(1, (sentiment['score'] + 1) / 2)))
+            else:
+                st.write(sentiment["error"])
+
+    # Tab 4: Portfolio
+    with tab4:
+        st.subheader("Portfolio Analytics")
+        st.write("**Portfolio Performance (Placeholder)**")
+        returns = np.random.normal(0.001, 0.02, 100)
+        sharpe_ratio = (np.mean(returns) / np.std(returns)) * np.sqrt(252)
+        st.write(f"Sample Portfolio Sharpe Ratio: {sharpe_ratio:.2f}")
+        chart_config = {
+            "type": "line",
+            "data": {
+                "labels": [f"Day {i}" for i in range(100)],
+                "datasets": [{
+                    "label": "Portfolio Returns",
+                    "data": returns.cumsum(),
+                    "borderColor": "#FF6384",
+                    "backgroundColor": "rgba(255, 99, 132, 0.2)",
+                    "fill": True
+                }]
+            },
+            "options": {
+                "responsive": True,
+                "plugins": {"title": {"display": True, "text": "Portfolio Returns"}},
+                "scales": {
+                    "y": {"title": {"display": True, "text": "Cumulative Return"}},
+                    "x": {"title": {"display": True, "text": "Time"}}
+                }
+            }
+        }
+        st.markdown(
+            f"""
+            <div style='width:100%; height:400px;'>
+                <canvas id='portfolio-chart'></canvas>
+            </div>
+            <script src='https://cdn.jsdelivr.net/npm/chart.js'></script>
+            <script>
+                var ctx = document.getElementById('portfolio-chart').getContext('2d');
+                new Chart(ctx, {json.dumps(chart_config)});
+            </script>
+            """,
+            unsafe_allow_html=True
+        )
+
+    # AI Query System
+    st.subheader("AI Query System")
+    query = st.text_input("Ask a financial question (e.g., 'What is AAPL's P/E ratio?')")
+    if query:
+        try:
+            context = f"Fundamentals for {ticker}: {get_stock_fundamentals(ticker)}"
+            result = nlp(question=query, context=context)
+            st.write(f"Answer: {result['answer']} (Confidence: {result['score']:.2f})")
+        except Exception as e:
+            st.write(f"Failed to process query: {e}")
+
+if __name__ == "__main__":
+    main()
